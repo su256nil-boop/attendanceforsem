@@ -1,0 +1,828 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+
+      - name: Write project files
+        run: |
+          set -e
+          P=app-project
+          mkdir -p $P/app $P/app/src/main $P/app/src/main/java/com/example/attendancewidget $P/app/src/main/res/drawable $P/app/src/main/res/layout $P/app/src/main/res/values $P/app/src/main/res/xml
+          cat > $P/settings.gradle <<'EOF_00'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AttendanceWidget"
+          include ':app'
+          EOF_00
+          cat > $P/build.gradle <<'EOF_01'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF_01
+          cat > $P/gradle.properties <<'EOF_02'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          EOF_02
+          cat > $P/app/build.gradle <<'EOF_03'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.example.attendancewidget'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.example.attendancewidget"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF_03
+          cat > $P/app/src/main/AndroidManifest.xml <<'EOF_04'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="Attendance"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".AttendanceWidget"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/attendance_widget_info" />
+                  </receiver>
+
+                  <service
+                      android:name=".AttendanceService"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_REMOTEVIEWS" />
+              </application>
+          </manifest>
+          EOF_04
+          cat > $P/app/src/main/java/com/example/attendancewidget/Store.kt <<'EOF_05'
+          package com.example.attendancewidget
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.util.Calendar
+
+          data class Subject(
+              var name: String,
+              var days: MutableSet<Int>,          // 0 = Mon ... 6 = Sun
+              var states: MutableMap<Int, Int>,   // is hafte ka: day -> 1 present, 2 absent
+              var present: Int,
+              var held: Int
+          )
+
+          object Store {
+              private const val PREFS = "attendance"
+              private const val KEY = "data"
+              const val TARGET = 75
+              val DAY_NAMES = listOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+              // B.Tech 1st Sem, Mechanical, Group 2
+              private fun defaultSubjects(): MutableList<Subject> = listOf(
+                  "Math" to listOf(0, 3, 4),
+                  "Math Tutorial" to listOf(0, 2, 3),
+                  "Chemistry" to listOf(0, 3, 4),
+                  "Economics" to listOf(0, 1, 2, 3),
+                  "BOE" to listOf(1, 2, 4),
+                  "FOEE" to listOf(1, 2, 4),
+                  "UHV-II" to listOf(3, 4),
+                  "BOE Lab" to listOf(0),
+                  "Chemistry Lab" to listOf(1),
+                  "FOEE Lab" to listOf(3)
+              ).map { (n, d) -> Subject(n, d.toMutableSet(), mutableMapOf(), 0, 0) }.toMutableList()
+
+              fun loadTimetable(ctx: Context) = save(ctx, defaultSubjects())
+
+              fun todayIndex(): Int = (Calendar.getInstance().get(Calendar.DAY_OF_WEEK) + 5) % 7
+
+              // Har hafte ki Monday ke hisab se ek unique number
+              private fun weekKey(): Int {
+                  val c = Calendar.getInstance()
+                  val dow = (c.get(Calendar.DAY_OF_WEEK) + 5) % 7 // Mon = 0
+                  c.add(Calendar.DAY_OF_YEAR, -dow)
+                  return c.get(Calendar.YEAR) * 1000 + c.get(Calendar.DAY_OF_YEAR)
+              }
+
+              fun load(ctx: Context): MutableList<Subject> {
+                  val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  val raw = prefs.getString(KEY, null)
+                  if (raw == null) {
+                      val d = defaultSubjects()
+                      save(ctx, d)
+                      return d
+                  }
+                  val root = JSONObject(raw)
+                  val list = mutableListOf<Subject>()
+                  val arr = root.getJSONArray("subjects")
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      val days = mutableSetOf<Int>()
+                      val da = o.getJSONArray("days")
+                      for (j in 0 until da.length()) days.add(da.getInt(j))
+                      val states = mutableMapOf<Int, Int>()
+                      val so = o.getJSONObject("states")
+                      val keys = so.keys()
+                      while (keys.hasNext()) {
+                          val k = keys.next()
+                          states[k.toInt()] = so.getInt(k)
+                      }
+                      list.add(Subject(o.getString("name"), days, states, o.getInt("present"), o.getInt("held")))
+                  }
+                  // Naya hafta shuru hua to circles reset (% waisa hi rahega)
+                  if (root.getInt("week") != weekKey()) {
+                      list.forEach { it.states.clear() }
+                      save(ctx, list)
+                  }
+                  return list
+              }
+
+              fun save(ctx: Context, list: List<Subject>) {
+                  val arr = JSONArray()
+                  for (s in list) {
+                      val o = JSONObject()
+                      o.put("name", s.name)
+                      o.put("days", JSONArray(s.days.toList()))
+                      val so = JSONObject()
+                      for ((k, v) in s.states) so.put(k.toString(), v)
+                      o.put("states", so)
+                      o.put("present", s.present)
+                      o.put("held", s.held)
+                      arr.put(o)
+                  }
+                  val root = JSONObject().put("week", weekKey()).put("subjects", arr)
+                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .edit().putString(KEY, root.toString()).apply()
+              }
+
+              // Jin dino ke columns widget me dikhne hain
+              fun activeDays(list: List<Subject>): List<Int> =
+                  list.flatMap { it.days }.distinct().sorted()
+
+              // Tap: circle -> present -> absent -> circle
+              fun cycle(ctx: Context, index: Int, day: Int) {
+                  val list = load(ctx)
+                  val s = list.getOrNull(index) ?: return
+                  if (day !in s.days) return
+                  val old = s.states[day] ?: 0
+                  val new = (old + 1) % 3
+                  if (old == 1) { s.present--; s.held-- } else if (old == 2) { s.held-- }
+                  if (new == 1) { s.present++; s.held++ } else if (new == 2) { s.held++ }
+                  if (new == 0) s.states.remove(day) else s.states[day] = new
+                  save(ctx, list)
+              }
+          }
+          EOF_05
+          cat > $P/app/src/main/java/com/example/attendancewidget/AttendanceWidget.kt <<'EOF_06'
+          package com.example.attendancewidget
+
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.view.View
+          import android.widget.RemoteViews
+
+          class AttendanceWidget : AppWidgetProvider() {
+
+              companion object {
+                  const val ACTION_TAP = "com.example.attendancewidget.TAP"
+                  const val EXTRA_SUBJECT = "subject"
+                  const val EXTRA_DAY = "day"
+                  private val HEADERS = intArrayOf(
+                      R.id.h0, R.id.h1, R.id.h2, R.id.h3, R.id.h4, R.id.h5, R.id.h6
+                  )
+
+                  fun refreshAll(ctx: Context) {
+                      val mgr = AppWidgetManager.getInstance(ctx)
+                      val ids = mgr.getAppWidgetIds(ComponentName(ctx, AttendanceWidget::class.java))
+                      for (id in ids) update(ctx, mgr, id)
+                      mgr.notifyAppWidgetViewDataChanged(ids, R.id.list)
+                  }
+
+                  private fun update(ctx: Context, mgr: AppWidgetManager, id: Int) {
+                      val views = RemoteViews(ctx.packageName, R.layout.widget_attendance)
+                      val active = Store.activeDays(Store.load(ctx))
+                      val today = Store.todayIndex()
+                      val hl = Color.parseColor("#66FFE98A")
+                      for (d in 0..6) {
+                          views.setViewVisibility(HEADERS[d], if (d in active) View.VISIBLE else View.GONE)
+                          views.setInt(HEADERS[d], "setBackgroundColor", if (d == today) hl else Color.TRANSPARENT)
+                      }
+
+                      val svc = Intent(ctx, AttendanceService::class.java)
+                      svc.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+                      svc.data = Uri.parse(svc.toUri(Intent.URI_INTENT_SCHEME))
+                      views.setRemoteAdapter(R.id.list, svc)
+                      views.setEmptyView(R.id.list, R.id.empty)
+
+                      val tap = Intent(ctx, AttendanceWidget::class.java).setAction(ACTION_TAP)
+                      views.setPendingIntentTemplate(
+                          R.id.list,
+                          PendingIntent.getBroadcast(
+                              ctx, 0, tap,
+                              PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                          )
+                      )
+
+                      val open = PendingIntent.getActivity(
+                          ctx, 1, Intent(ctx, MainActivity::class.java),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      views.setOnClickPendingIntent(R.id.btn_settings, open)
+                      views.setOnClickPendingIntent(R.id.empty, open)
+
+                      mgr.updateAppWidget(id, views)
+                  }
+              }
+
+              override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
+                  refreshAll(context)
+              }
+
+              override fun onReceive(context: Context, intent: Intent) {
+                  super.onReceive(context, intent)
+                  if (intent.action == ACTION_TAP) {
+                      Store.cycle(
+                          context,
+                          intent.getIntExtra(EXTRA_SUBJECT, -1),
+                          intent.getIntExtra(EXTRA_DAY, -1)
+                      )
+                      refreshAll(context)
+                  }
+              }
+          }
+          EOF_06
+          cat > $P/app/src/main/java/com/example/attendancewidget/AttendanceService.kt <<'EOF_07'
+          package com.example.attendancewidget
+
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.view.View
+          import android.widget.RemoteViews
+          import android.widget.RemoteViewsService
+
+          private val CELLS = intArrayOf(
+              R.id.c0, R.id.c1, R.id.c2, R.id.c3, R.id.c4, R.id.c5, R.id.c6
+          )
+
+          class AttendanceService : RemoteViewsService() {
+
+              override fun onGetViewFactory(intent: Intent): RemoteViewsService.RemoteViewsFactory =
+                  Factory(applicationContext)
+
+              class Factory(private val ctx: Context) : RemoteViewsService.RemoteViewsFactory {
+                  private var subjects: List<Subject> = emptyList()
+                  private var active: List<Int> = emptyList()
+
+                  override fun onCreate() {}
+
+                  override fun onDataSetChanged() {
+                      subjects = Store.load(ctx)
+                      active = Store.activeDays(subjects)
+                  }
+
+                  override fun onDestroy() {}
+                  override fun getCount(): Int = subjects.size
+                  override fun getLoadingView(): RemoteViews? = null
+                  override fun getViewTypeCount(): Int = 1
+                  override fun getItemId(position: Int): Long = position.toLong()
+                  override fun hasStableIds(): Boolean = true
+
+                  override fun getViewAt(position: Int): RemoteViews {
+                      val v = RemoteViews(ctx.packageName, R.layout.widget_row)
+                      val s = subjects.getOrNull(position) ?: return v
+                      val today = Store.todayIndex()
+                      val hl = Color.parseColor("#66FFE98A")
+                      v.setTextViewText(R.id.r_name, s.name)
+
+                      for (d in 0..6) {
+                          val id = CELLS[d]
+                          if (d !in active) {
+                              v.setViewVisibility(id, View.GONE)
+                              continue
+                          }
+                          v.setViewVisibility(id, View.VISIBLE)
+                          v.setInt(id, "setBackgroundColor", if (d == today) hl else Color.TRANSPARENT)
+                          if (d !in s.days) {
+                              v.setTextViewText(id, "-")
+                              v.setTextColor(id, Color.parseColor("#55FFFFFF"))
+                          } else {
+                              when (s.states[d] ?: 0) {
+                                  1 -> {
+                                      v.setTextViewText(id, "\u25CF")
+                                      v.setTextColor(id, Color.parseColor("#4CAF50"))
+                                  }
+                                  2 -> {
+                                      v.setTextViewText(id, "\u2715")
+                                      v.setTextColor(id, Color.parseColor("#F44336"))
+                                  }
+                                  else -> {
+                                      v.setTextViewText(id, "\u25CB")
+                                      v.setTextColor(id, Color.WHITE)
+                                  }
+                              }
+                              val fill = Intent()
+                                  .putExtra(AttendanceWidget.EXTRA_SUBJECT, position)
+                                  .putExtra(AttendanceWidget.EXTRA_DAY, d)
+                              v.setOnClickFillInIntent(id, fill)
+                          }
+                      }
+
+                      if (s.held == 0) {
+                          v.setTextViewText(R.id.r_pct, "--")
+                          v.setTextColor(R.id.r_pct, Color.parseColor("#B0BEC5"))
+                      } else {
+                          val pct = s.present * 100.0 / s.held
+                          val ok = s.present * 100 >= Store.TARGET * s.held
+                          val txt = if (pct % 1.0 == 0.0) pct.toInt().toString() + "%" else String.format("%.1f%%", pct)
+                          v.setTextViewText(R.id.r_pct, txt)
+                          v.setTextColor(R.id.r_pct, Color.parseColor(if (ok) "#4CAF50" else "#F44336"))
+                      }
+                      return v
+                  }
+              }
+          }
+          EOF_07
+          cat > $P/app/src/main/java/com/example/attendancewidget/MainActivity.kt <<'EOF_08'
+          package com.example.attendancewidget
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private lateinit var container: LinearLayout
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val page = LinearLayout(this)
+                  page.orientation = LinearLayout.VERTICAL
+                  page.setPadding(dp(16), dp(16), dp(16), dp(24))
+
+                  val title = TextView(this)
+                  title.text = "Mere Subjects"
+                  title.textSize = 24f
+                  page.addView(title)
+
+                  val help = TextView(this)
+                  help.text = "Widget lagane ke liye: home screen pe khali jagah long-press karo, Widgets me jao aur Attendance chuno.\n\nSubject edit karne ke liye naam pe tap karo."
+                  help.setPadding(0, dp(6), 0, dp(10))
+                  page.addView(help)
+
+                  container = LinearLayout(this)
+                  container.orientation = LinearLayout.VERTICAL
+                  page.addView(container)
+
+                  val add = Button(this)
+                  add.text = "+ Subject add karo"
+                  add.setOnClickListener { showDialog(null) }
+                  page.addView(add)
+
+                  val tt = Button(this)
+                  tt.text = "Time table (Group 2) dobara load karo"
+                  tt.setOnClickListener { confirmTimetable() }
+                  page.addView(tt)
+
+                  val reset = Button(this)
+                  reset.text = "Attendance reset karo"
+                  reset.setOnClickListener { confirmReset() }
+                  page.addView(reset)
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(page)
+                  setContentView(scroll)
+                  render()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  render()
+              }
+
+              private fun render() {
+                  container.removeAllViews()
+                  val list = Store.load(this)
+                  if (list.isEmpty()) {
+                      val t = TextView(this)
+                      t.text = "Abhi koi subject nahi hai."
+                      t.setPadding(0, dp(12), 0, dp(12))
+                      container.addView(t)
+                  }
+                  list.forEachIndexed { i, s ->
+                      val row = LinearLayout(this)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      row.gravity = Gravity.CENTER_VERTICAL
+                      row.setPadding(0, dp(8), 0, dp(8))
+
+                      val days = s.days.sorted().joinToString(", ") { Store.DAY_NAMES[it] }
+                      val info = TextView(this)
+                      info.text = s.name + "\n" + days + "   (" + s.present + "/" + s.held + ")"
+                      info.textSize = 16f
+                      info.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                      info.setOnClickListener { showDialog(i) }
+                      row.addView(info)
+
+                      val del = Button(this)
+                      del.text = "Delete"
+                      del.setOnClickListener { confirmDelete(i) }
+                      row.addView(del)
+
+                      container.addView(row)
+                  }
+              }
+
+              private fun changed() {
+                  render()
+                  AttendanceWidget.refreshAll(this)
+              }
+
+              private fun showDialog(index: Int?) {
+                  val list = Store.load(this)
+                  val existing: Subject? = if (index != null) list.getOrNull(index) else null
+
+                  val input = EditText(this)
+                  input.hint = "Subject ka naam (jaise Math)"
+                  input.setSingleLine()
+                  input.setText(existing?.name ?: "")
+
+                  val label = TextView(this)
+                  label.text = "Kis kis din class hoti hai?"
+                  label.setPadding(0, dp(12), 0, dp(4))
+
+                  val boxes = ArrayList<CheckBox>()
+                  for (i in 0..6) {
+                      val cb = CheckBox(this)
+                      cb.text = Store.DAY_NAMES[i]
+                      cb.isChecked = existing?.days?.contains(i) ?: false
+                      boxes.add(cb)
+                  }
+
+                  val layout = LinearLayout(this)
+                  layout.orientation = LinearLayout.VERTICAL
+                  layout.setPadding(dp(24), dp(16), dp(24), 0)
+                  layout.addView(input)
+                  layout.addView(label)
+                  for (cb in boxes) layout.addView(cb)
+
+                  val sv = ScrollView(this)
+                  sv.addView(layout)
+
+                  AlertDialog.Builder(this)
+                      .setTitle(if (existing == null) "Subject add karo" else "Subject edit karo")
+                      .setView(sv)
+                      .setPositiveButton("Save") { _, _ ->
+                          val name = input.text.toString().trim()
+                          val days = mutableSetOf<Int>()
+                          for (i in 0..6) if (boxes[i].isChecked) days.add(i)
+                          if (name.isEmpty() || days.isEmpty()) {
+                              Toast.makeText(this, "Naam aur kam se kam ek din chuno", Toast.LENGTH_SHORT).show()
+                          } else {
+                              if (existing == null) {
+                                  list.add(Subject(name, days, mutableMapOf(), 0, 0))
+                              } else {
+                                  // Jo din hata diye, unki marked entry wapas lo
+                                  for (d in existing.days.toList()) {
+                                      if (d !in days) {
+                                          val st = existing.states[d] ?: 0
+                                          if (st == 1) { existing.present--; existing.held-- }
+                                          else if (st == 2) { existing.held-- }
+                                          existing.states.remove(d)
+                                      }
+                                  }
+                                  existing.name = name
+                                  existing.days = days
+                              }
+                              Store.save(this, list)
+                              changed()
+                          }
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun confirmDelete(index: Int) {
+                  AlertDialog.Builder(this)
+                      .setMessage("Ye subject delete kar du?")
+                      .setPositiveButton("Delete") { _, _ ->
+                          val list = Store.load(this)
+                          if (index in list.indices) list.removeAt(index)
+                          Store.save(this, list)
+                          changed()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun confirmTimetable() {
+                  AlertDialog.Builder(this)
+                      .setMessage("Purane subjects hat jayenge aur time table wale subjects aa jayenge. Pakka?")
+                      .setPositiveButton("Haan") { _, _ ->
+                          Store.loadTimetable(this)
+                          changed()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun confirmReset() {
+                  AlertDialog.Builder(this)
+                      .setMessage("Sabhi subjects ki attendance 0 kar du? (Subjects rahenge)")
+                      .setPositiveButton("Reset") { _, _ ->
+                          val list = Store.load(this)
+                          for (s in list) { s.states.clear(); s.present = 0; s.held = 0 }
+                          Store.save(this, list)
+                          changed()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+          }
+          EOF_08
+          cat > $P/app/src/main/res/values/strings.xml <<'EOF_09'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Attendance</string>
+          </resources>
+          EOF_09
+          cat > $P/app/src/main/res/values/styles.xml <<'EOF_10'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="WidgetHeader">
+                  <item name="android:layout_width">0dp</item>
+                  <item name="android:layout_height">wrap_content</item>
+                  <item name="android:layout_weight">1</item>
+                  <item name="android:gravity">center</item>
+                  <item name="android:textColor">#B0BEC5</item>
+                  <item name="android:textSize">11sp</item>
+              </style>
+              <style name="WidgetCell">
+                  <item name="android:layout_width">0dp</item>
+                  <item name="android:layout_height">wrap_content</item>
+                  <item name="android:layout_weight">1</item>
+                  <item name="android:gravity">center</item>
+                  <item name="android:paddingTop">6dp</item>
+                  <item name="android:paddingBottom">6dp</item>
+                  <item name="android:textColor">#FFFFFF</item>
+                  <item name="android:textSize">19sp</item>
+              </style>
+          </resources>
+          EOF_10
+          cat > $P/app/src/main/res/drawable/widget_bg.xml <<'EOF_11'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="#E61E1E2E" />
+              <corners android:radius="20dp" />
+          </shape>
+          EOF_11
+          cat > $P/app/src/main/res/drawable/ic_launcher.xml <<'EOF_12'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#1B2A49"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M54,54m-30,0a30,30 0,1 1,60 0a30,30 0,1 1,-60 0" />
+              <path
+                  android:fillColor="#1E8A5A"
+                  android:pathData="M42,54l9,9l17,-19l-5,-5l-12,14l-4,-4z" />
+          </vector>
+          EOF_12
+          cat > $P/app/src/main/res/xml/attendance_widget_info.xml <<'EOF_13'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp"
+              android:minHeight="250dp"
+              android:targetCellWidth="4"
+              android:targetCellHeight="4"
+              android:updatePeriodMillis="1800000"
+              android:initialLayout="@layout/widget_attendance"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen"
+              android:description="@string/app_name" />
+          EOF_13
+          cat > $P/app/src/main/res/layout/widget_attendance.xml <<'EOF_14'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="10dp"
+              android:background="@drawable/widget_bg">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal">
+
+                  <TextView
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:text="Attendance"
+                      android:textColor="#FFFFFF"
+                      android:textSize="15sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/btn_settings"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:padding="4dp"
+                      android:text="Edit"
+                      android:textColor="#B0BEC5"
+                      android:textSize="13sp" />
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal"
+                  android:paddingTop="4dp"
+                  android:paddingBottom="2dp">
+
+                  <TextView
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="2.2"
+                      android:text="Subject"
+                      android:textColor="#B0BEC5"
+                      android:textSize="11sp" />
+
+                  <TextView android:id="@+id/h0" style="@style/WidgetHeader" android:text="Mon" />
+                  <TextView android:id="@+id/h1" style="@style/WidgetHeader" android:text="Tue" />
+                  <TextView android:id="@+id/h2" style="@style/WidgetHeader" android:text="Wed" />
+                  <TextView android:id="@+id/h3" style="@style/WidgetHeader" android:text="Thu" />
+                  <TextView android:id="@+id/h4" style="@style/WidgetHeader" android:text="Fri" />
+                  <TextView android:id="@+id/h5" style="@style/WidgetHeader" android:text="Sat" />
+                  <TextView android:id="@+id/h6" style="@style/WidgetHeader" android:text="Sun" />
+
+                  <TextView
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1.6"
+                      android:gravity="center"
+                      android:text="%"
+                      android:textColor="#B0BEC5"
+                      android:textSize="11sp" />
+              </LinearLayout>
+
+              <ListView
+                  android:id="@+id/list"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:divider="#22FFFFFF"
+                  android:dividerHeight="1dp" />
+
+              <TextView
+                  android:id="@+id/empty"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:gravity="center"
+                  android:text="Koi subject nahi hai. Yaha tap karke add karo."
+                  android:textColor="#B0BEC5"
+                  android:textSize="13sp" />
+          </LinearLayout>
+          EOF_14
+          cat > $P/app/src/main/res/layout/widget_row.xml <<'EOF_15'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:orientation="horizontal"
+              android:gravity="center_vertical"
+              android:paddingTop="2dp"
+              android:paddingBottom="2dp">
+
+              <TextView
+                  android:id="@+id/r_name"
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_weight="2.2"
+                  android:ellipsize="end"
+                  android:singleLine="true"
+                  android:textColor="#FFFFFF"
+                  android:textSize="13sp" />
+
+              <TextView android:id="@+id/c0" style="@style/WidgetCell" />
+              <TextView android:id="@+id/c1" style="@style/WidgetCell" />
+              <TextView android:id="@+id/c2" style="@style/WidgetCell" />
+              <TextView android:id="@+id/c3" style="@style/WidgetCell" />
+              <TextView android:id="@+id/c4" style="@style/WidgetCell" />
+              <TextView android:id="@+id/c5" style="@style/WidgetCell" />
+              <TextView android:id="@+id/c6" style="@style/WidgetCell" />
+
+              <TextView
+                  android:id="@+id/r_pct"
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_weight="1.6"
+                  android:gravity="center"
+                  android:textSize="12sp"
+                  android:textStyle="bold" />
+          </LinearLayout>
+          EOF_15
+
+      - name: Build debug APK
+        working-directory: app-project
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Attendance APK ${{ github.run_number }}
+          files: app-project/app/build/outputs/apk/debug/app-debug.apk
